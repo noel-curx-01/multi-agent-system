@@ -1,403 +1,150 @@
 # Building an Intelligent Multi-Agent Insurance Support System with LangGraph and RAG
 
-![Multi-Agent System Architecture](https://img.shields.io/badge/AI-Multi--Agent%20System-blue) ![Python](https://img.shields.io/badge/Python-3.8%2B-green) ![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-orange)
+![Multi-Agent System Architecture](https://img.shields.io/badge/AI-Multi--Agent%20System-blue) ![Python](https://img.shields.io/badge/Python-3.10%2B-green) ![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-orange)
 
-## Introduction: The Future of Customer Support is Here
+## Overview
 
-Imagine calling your insurance company and being instantly connected to a team of specialists—each an expert in their domain—working together seamlessly to resolve your query. No more endless transfers, no more repeating your story. This is the promise of **multi-agent AI systems**.
+This project walks through an end-to-end insurance support copilot that combines LangGraph, Retrieval-Augmented Generation (RAG), and structured data to resolve customer requests. The companion notebook (`multi-agent system.ipynb`) shows how to stand up the data stack, orchestrate specialized agents, and observe every hop with Phoenix tracing.
 
-In this article, I'll walk you through building a sophisticated multi-agent insurance support system that intelligently routes customer queries to specialized agents, retrieves information from databases, and leverages RAG (Retrieval-Augmented Generation) for accurate responses.
+## What’s New in the Notebook
 
----
+- **Phoenix-powered observability**: every agent function is wrapped with an OpenTelemetry span so you can replay decisions inside Arize Phoenix.
+- **Clarification-aware supervisor**: the router uses OpenAI function calling to request missing context before delegating work.
+- **Final answer agent**: conversations end with a summarizer that rewrites the last specialist message into a customer-ready response.
+- **Guard rails for infinite loops**: the supervisor escalates to a human after three failed routing attempts.
+- **Notebook test harness**: reusable `run_test_query` helper to exercise the full graph from within the notebook.
 
-## 🎯 What We're Building
+## Tech Stack
 
-Our system features:
+- **LangGraph** for multi-agent workflow orchestration.
+- **OpenAI GPT-5 Mini** for routing, tool-calling, and final responses.
+- **SQLite** for relational policy, billing, and claims data.
+- **ChromaDB** for semantic FAQ retrieval.
+- **Arize Phoenix** (OpenTelemetry backend) for tracing and debugging.
 
-1. **Supervisor Agent** - The orchestrator that analyzes user intent and routes to appropriate specialists
-2. **Policy Agent** - Handles policy details, coverage, and auto insurance specifics
-3. **Billing Agent** - Manages billing inquiries, payment history, and invoice information
-4. **Claims Agent** - Processes claim status and filing assistance
-5. **General Help Agent** - Answers FAQs using RAG with a vector database
-6. **Human Escalation Agent** - Gracefully hands off complex cases to human representatives
-
-The system uses **LangGraph** for workflow orchestration, **ChromaDB** for semantic search, **SQLite** for structured data, and **OpenAI GPT** for natural language understanding.
-
----
-
-## 🏗️ System Architecture
+## Architecture
 
 ```mermaid
-graph TD;
+graph TD
     User[User Query] --> Supervisor[Supervisor Agent]
     Supervisor --> Policy[Policy Agent]
     Supervisor --> Billing[Billing Agent]
     Supervisor --> Claims[Claims Agent]
     Supervisor --> General[General Help Agent]
-    Supervisor --> Human[Human Escalation]
+    Supervisor --> Human[Human Escalation Agent]
     Supervisor --> Final[Final Answer Agent]
-    
+
     Policy --> Database[(SQLite DB)]
     Billing --> Database
     Claims --> Database
     General --> VectorDB[(ChromaDB)]
-    
+
     Policy --> Supervisor
     Billing --> Supervisor
     Claims --> Supervisor
     General --> Supervisor
-    
-    Final --> End[End]
+
+    Final --> End[Conversation Complete]
     Human --> End
 ```
 
-The workflow operates as a **state machine** where:
-- Each agent is a node in the graph
-- The supervisor makes routing decisions
-- Specialists return to the supervisor after completing their tasks
-- The conversation ends when the query is resolved or escalated
+The LangGraph workflow is compiled into a state machine. Each specialist node returns to the supervisor, which decides whether to continue the loop, escalate, or pass control to the final answer agent.
 
----
+## Data Foundations
 
-## 🧠 The Core Components
+1. **FAQ Retrieval (ChromaDB)**
+   - Hugging Face dataset `deccan-ai/insuranceQA-v2` is ingested and embedded into a persistent Chroma collection (`insurance_FAQ_collection`).
+   - Retrieval batches (size 100) keep ingest jobs fast while respecting API limits.
 
-### 1. State Management with TypedDict
+2. **Synthetic Insurance Warehouse (SQLite)**
+   - 1,000 customers, 1,500 policies, and supporting billing, payments, and claims tables.
+   - `setup_insurance_database(sample_data)` drops and recreates the schema before inserting fresh synthetic rows, ensuring notebook re-runs stay deterministic.
 
-We define a comprehensive state that tracks the entire conversation:
+## Monitoring with Phoenix
+
+Every agent is decorated with `@trace_agent`, a wrapper that:
+- Opens a Phoenix span with metadata such as `agent.name`, `policy.number`, and duration.
+- Captures exceptions and marks spans with `StatusCode.ERROR` for quick triage.
+- Provides a consistent way to correlate user journeys in Phoenix’s UI.
+
+```python
+@trace_agent
+def billing_agent_node(state):
+    logger.info("📊 Billing agent started")
+    # ... call tools, update state, emit telemetry ...
+    return updated_state
+```
+
+Phoenix endpoint and OpenAI credentials are loaded from `.env`, so be sure to set `OPEN_AI_KEY` and `PHOENIX_COLLECTOR_ENDPOINT` before running the notebook.
+
+## Graph State & Routing Logic
+
+The notebook defines a richer `GraphState` that persists:
 
 ```python
 class GraphState(TypedDict):
     messages: Annotated[List[Any], add_messages]
     user_input: str
     conversation_history: Optional[str]
-    
-    # Context extraction
+    n_iteration: Optional[int]
+    user_intent: Optional[str]
     customer_id: Optional[str]
     policy_number: Optional[str]
     claim_id: Optional[str]
-    
-    # Routing
     next_agent: Optional[str]
     task: Optional[str]
-    
-    # Escalation
+    justification: Optional[str]
+    end_conversation: Optional[bool]
+    extracted_entities: Dict[str, Any]
+    database_lookup_result: Dict[str, Any]
     requires_human_escalation: bool
     escalation_reason: Optional[str]
+    billing_amount: Optional[float]
+    payment_method: Optional[str]
+    billing_frequency: Optional[str]
+    invoice_date: Optional[str]
+    timestamp: Optional[str]
+    final_answer: Optional[str]
 ```
 
-This state is passed between agents, accumulating context and maintaining conversation coherence.
+- **Clarification cycle**: When the supervisor invokes the `ask_user` tool, it sets `needs_clarification` and waits for the follow-up before re-routing.
+- **Loop breaker**: After three supervisor loops, the state is forced to `human_escalation_agent`.
+- **END detection**: When `end_conversation` flips to `True`, the graph routes to `final_answer_agent` which pushes the user-facing summary back into the state.
 
-### 2. Intelligent Routing with the Supervisor
+## Specialist Agents
 
-The supervisor agent is the brain of the operation:
+- **Policy / Billing / Claims Agents** use structured tool calls (`get_policy_details`, `get_payment_history`, `get_claim_status`) to ground outputs in SQLite.
+- **General Help Agent** retrieves the top three FAQ snippets from Chroma, annotating answers with relevance scores.
+- **Human Escalation Agent** acknowledges the handoff and logs `escalation_reason` for operational dashboards.
+- **Final Answer Agent** rewrites the latest specialist response into a polite closing stanza so that users always receive a clean summary.
+
+## Running the Notebook
+
+1. `pip install -r requirements.txt`
+2. Populate environment variables (`OPEN_AI_KEY`, `PHOENIX_COLLECTOR_ENDPOINT`).
+3. Run the “Data Infrastructure” cells to seed Chroma and SQLite.
+4. Execute the “Setting up Nodes and Edges in LangGraph” section to compile the workflow and render the mermaid preview.
+5. Use the testing helpers to exercise scenarios:
 
 ```python
-def supervisor_agent(state):
-    # Extract context from conversation history
-    user_query = state["user_input"]
-    conversation_history = state.get("conversation_history", "")
-    
-    # Check for existing context (policy number, customer ID)
-    policy_number = state.get("policy_number")
-    customer_id = state.get("customer_id")
-    
-    # Make routing decision using LLM
-    prompt = SUPERVISOR_PROMPT.format(
-        conversation_history=conversation_history,
-        policy_number=policy_number or "Not provided",
-        customer_id=customer_id or "Not provided"
-    )
-    
-    # LLM returns JSON with next_agent and task
-    decision = run_llm_with_tools(prompt, tools, tool_functions)
-    
-    return {
-        "next_agent": decision["next_agent"],
-        "task": decision["task"]
-    }
+run_test_query("What is the premium of my auto insurance policy?")
+run_test_query("In general, what does life insurance cover?")
+run_test_query("I want to talk to human executive")
 ```
 
-The supervisor:
-- Analyzes user intent
-- Checks available context
-- Avoids redundant clarification questions
-- Routes to the most appropriate specialist
+Each invocation prints the agent hop trace and the final customer answer.
 
-### 3. Specialized Agent Tools
+## Sample Walkthroughs
 
-Each agent has access to specific tools for database queries:
+- **Billing Premium Lookup**: Supervisor obtains the missing policy number, billing agent queries SQLite, final answer agent produces a concise plan overview.
+- **FAQ Support**: Supervisor detects general intent, FAQ agent returns a grounded answer with retrieved context, and the final agent wraps up with a friendly closing.
+- **Escalation Path**: Explicit escalation requests or three failed supervisor loops push control to the human escalation agent, preserving the conversation history for handoff.
 
-**Policy Agent Tools:**
-```python
-def get_policy_details(policy_number: str) -> Dict[str, Any]:
-    """Fetch policy details from SQLite"""
-    conn = sqlite3.connect('insurance_support.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT p.*, c.first_name, c.last_name 
-        FROM policies p 
-        JOIN customers c ON p.customer_id = c.customer_id 
-        WHERE p.policy_number = ?
-    """, (policy_number,))
-    # Return policy data
-```
+## Next Steps
 
-**Billing Agent Tools:**
-```python
-def get_billing_info(policy_number: str) -> Dict[str, Any]:
-    """Retrieve billing information"""
-    # Query billing table for pending invoices
-    
-def get_payment_history(policy_number: str) -> List[Dict]:
-    """Get recent payment records"""
-    # Query payment history
-```
-
-These tools enable agents to access real data and provide accurate, personalized responses.
-
-### 4. RAG-Powered General Help with ChromaDB
-
-The General Help Agent uses retrieval-augmented generation:
-
-```python
-def general_help_agent_node(state):
-    user_query = state.get("user_input")
-    
-    # Step 1: Retrieve relevant FAQs from ChromaDB
-    results = collection.query(
-        query_texts=[user_query],
-        n_results=3,
-        include=["metadatas", "documents", "distances"]
-    )
-    
-    # Step 2: Format retrieved context
-    faq_context = format_faqs(results)
-    
-    # Step 3: Generate response with LLM
-    prompt = GENERAL_HELP_PROMPT.format(
-        task=state["task"],
-        conversation_history=state["conversation_history"],
-        faq_context=faq_context
-    )
-    
-    answer = llm_without_tool(prompt)
-    return {"messages": [("assistant", answer)]}
-```
-
-This approach ensures factual accuracy by grounding responses in actual FAQ data.
-
----
-
-## 📊 Data Infrastructure
-
-### Synthetic Data Generation
-
-We generate realistic insurance data with 1,000 customers and multiple policies:
-
-```python
-def generate_sample_data():
-    # Generate customers with random names
-    customers = pd.DataFrame({
-        'customer_id': [f'CUST{str(i).zfill(5)}' for i in range(1, 1001)],
-        'first_name': [random.choice(first_names) for _ in range(1000)],
-        'last_name': [random.choice(last_names) for _ in range(1000)],
-        'email': [f'user{i}@example.com' for i in range(1, 1001)],
-        # ... more fields
-    })
-    
-    # Generate 1,500 policies (auto, home, life)
-    # Generate billing records, payments, claims, etc.
-```
-
-### Database Schema
-
-The SQLite database includes:
-- **customers** - Customer profiles
-- **policies** - Policy details (type, premium, status)
-- **auto_policy_details** - Vehicle-specific data
-- **billing** - Invoice and due dates
-- **payments** - Payment transactions
-- **claims** - Claim records and status
-- **claim_documents** - Supporting documentation
-
-### Vector Database for FAQs
-
-ChromaDB stores insurance Q&A pairs with semantic embeddings:
-
-```python
-# Load insurance FAQ dataset
-df = load_dataset("deccan-ai/insuranceQA-v2")
-
-# Create ChromaDB collection
-collection = client.get_or_create_collection(name="insurance_FAQ_collection")
-
-# Add FAQ documents with metadata
-collection.add(
-    documents=df["combined"].tolist(),
-    metadatas=[{"question": q, "answer": a} for q, a in zip(df["input"], df["output"])],
-    ids=df.index.astype(str).tolist()
-)
-```
-
----
-
-## 🔧 LangGraph Workflow Implementation
-
-LangGraph orchestrates the agent interactions:
-
-```python
-from langgraph.graph import StateGraph, END
-
-workflow = StateGraph(GraphState)
-
-# Add all agent nodes
-workflow.add_node("supervisor_agent", supervisor_agent)
-workflow.add_node("policy_agent", policy_agent_node)
-workflow.add_node("billing_agent", billing_agent_node)
-workflow.add_node("claims_agent", claims_agent_node)
-workflow.add_node("general_help_agent", general_help_agent_node)
-workflow.add_node("human_escalation_agent", human_escalation_node)
-
-# Set entry point
-workflow.set_entry_point("supervisor_agent")
-
-# Define routing logic
-workflow.add_conditional_edges(
-    "supervisor_agent",
-    decide_next_agent,
-    {
-        "policy_agent": "policy_agent",
-        "billing_agent": "billing_agent",
-        "claims_agent": "claims_agent",
-        "general_help_agent": "general_help_agent",
-        "human_escalation_agent": "human_escalation_agent",
-        "end": END
-    }
-)
-
-# Specialists return to supervisor
-for agent in ["policy_agent", "billing_agent", "claims_agent", "general_help_agent"]:
-    workflow.add_edge(agent, "supervisor_agent")
-
-# Compile the graph
-app = workflow.compile()
-```
-
----
-
-## 💡 Key Design Patterns
-
-### 1. **Context Preservation**
-
-The system maintains conversation context across agent transitions:
-
-```python
-# Each agent updates conversation history
-updated_state["conversation_history"] = (
-    current_history + f"\n{agent_name}: {response}"
-)
-```
-
-This prevents users from repeating information and enables natural multi-turn conversations.
-
-### 2. **Minimal Clarification Strategy**
-
-The supervisor only asks for essential missing information:
-
-```python
-# Supervisor checks existing context before asking
-if policy_number or customer_id:
-    # Route directly to specialist
-else:
-    # Ask for minimal required info (≤15 words)
-```
-
-### 3. **Tool-Calling Pattern**
-
-Agents use function calling to access data:
-
-```python
-def run_llm_with_tools(prompt, tools, tool_functions):
-    # Step 1: Ask LLM with tool availability
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "system", "content": prompt}],
-        tools=tools,
-        tool_choice="auto"
-    )
-    
-    # Step 2: Execute requested tools
-    for tool_call in response.tool_calls:
-        result = tool_functions[tool_call.function.name](**args)
-    
-    # Step 3: Return final answer with tool results
-    return final_response
-```
-
-### 4. **Logging and Observability**
-
-Comprehensive logging tracks system behavior:
-
-```python
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('insurance_agent.log'),
-        logging.StreamHandler()
-    ]
-)
-
-logger.info(f"🔍 Fetching policy details for: {policy_number}")
-logger.warning(f"❌ Policy not found: {policy_number}")
-```
-
----
-
-## 🚀 Example Interactions
-
-### Query 1: Billing Information
-
-```
-User: "What is my premium for auto insurance?"
-Supervisor: Routes to billing_agent
-Billing Agent: Asks for policy number
-User: "POL000123"
-Billing Agent: Returns "$250/month, due on 15th"
-```
-
-### Query 2: General FAQ
-
-```
-User: "What does life insurance cover?"
-Supervisor: Routes to general_help_agent
-General Help Agent: 
-  - Retrieves top 3 relevant FAQs from ChromaDB
-  - Synthesizes answer from retrieved context
-  - Responds with accurate information
-```
-
-### Query 3: Complex Escalation
-
-```
-User: "I want to speak to a manager about my denied claim"
-Supervisor: Detects escalation intent
-Human Escalation Agent: 
-  - Acknowledges frustration
-  - Confirms human handoff
-  - Logs escalation reason
-```
-
----
-
-## 📈 Performance and Benefits
-
-### Advantages of Multi-Agent Architecture
-
-1. **Specialization** - Each agent is optimized for specific tasks
-2. **Scalability** - Easy to add new agent types (e.g., fraud detection)
-3. **Maintainability** - Agents can be updated independently
-4. **Accuracy** - Specialists have focused tools and knowledge
+1. Plug in live insurance systems by swapping the SQLite helpers for REST or gRPC clients.
+2. Extend RAG coverage with additional knowledge bases (policy booklets, state regulations).
+3. Add automated evaluation by replaying `run_test_query` scenarios with Phoenix traces and regression metrics.
 5. **User Experience** - Natural conversation flow with context retention
 
 
